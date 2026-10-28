@@ -1,0 +1,303 @@
+name: autograde
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  autograde:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: Install test deps
+        run: |
+          npm init -y >/dev/null 2>&1 || true
+          npm install --save-dev jest@29 jsdom@21 jest-environment-jsdom@29
+
+      - name: Write jest setup
+        run: |
+          cat > jest.setup.cjs <<'EOF'
+          const { TextEncoder, TextDecoder } = require('util');
+          if (typeof global.TextEncoder === 'undefined') global.TextEncoder = TextEncoder;
+          if (typeof global.TextDecoder === 'undefined') global.TextDecoder = TextDecoder;
+          EOF
+
+      - name: Write jest config
+        run: |
+          cat > jest.config.cjs <<'EOF'
+          module.exports = {
+            testEnvironment: 'jsdom',
+            setupFiles: ['<rootDir>/jest.setup.cjs'],
+            testMatch: ['**/__tests__/**/*.test.cjs'],
+            testTimeout: 15000
+          };
+          EOF
+
+      - name: Write tests
+        run: |
+          mkdir -p __tests__
+          cat > __tests__/dateobj.test.cjs <<'TESTEOF'
+          const fs = require('fs');
+          const path = require('path');
+          const { JSDOM, VirtualConsole } = require('jsdom');
+
+          const wait = function(ms) { return new Promise(function(r) { setTimeout(r, ms || 50); }); };
+          var source = '';
+          try { source = fs.readFileSync(path.resolve('script.js'), 'utf8'); } catch(e) {}
+
+          function byId(doc, id) { return doc.getElementById(id); }
+          function text(doc, id) {
+            var el = byId(doc, id);
+            return (el && (el.textContent || el.innerText) || '').trim();
+          }
+          function click(doc, id) {
+            var el = byId(doc, id);
+            if (el) el.click();
+          }
+
+          async function loadDOM() {
+            var idx = 'index.html';
+            if (!fs.existsSync(idx)) throw new Error('index.html not found');
+            var vconsole = new VirtualConsole();
+            vconsole.on('error', function() {});
+            var baseDir = path.dirname(path.resolve(idx));
+            var baseUrl = 'file://' + baseDir.replace(/\\+/g, '/') + '/';
+            var dom = await JSDOM.fromFile(idx, {
+              url: baseUrl,
+              runScripts: 'dangerously',
+              resources: 'usable',
+              pretendToBeVisual: true,
+              virtualConsole: vconsole
+            });
+            dom.window.alert = function() {};
+            dom.window.prompt = function() { return ''; };
+            await new Promise(function(res) {
+              dom.window.addEventListener('load', res, { once: true });
+            });
+            await wait();
+            return dom;
+          }
+
+          // script.js with its comment lines removed. The STEP comments name the
+          // very things these checks look for, so a check of the whole file would
+          // pass on untouched starter code.
+          function codeLines() {
+            return source.split('\n')
+              .map(function(line) { return line.trim(); })
+              .filter(function(line) { return !line.startsWith('//') && !line.startsWith('*'); })
+              .join('\n');
+          }
+
+          describe('Unit 8.8 – The Date Object', function() {
+            var dom, window, document;
+            // A fresh page for every test. Each graded step runs ONE test on
+            // its own page, so a shared page let the summary's timer tests
+            // depend on the toggle clicks of earlier tests.
+            beforeEach(async function() {
+              dom = await loadDOM();
+              window = dom.window;
+              document = window.document;
+            });
+            afterEach(function() { if (dom) dom.window.close(); });
+
+            test('day name warm up', function() {
+              var dayText = text(document, 'warmUpDate');
+              var days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday',
+                'Thursday', 'Friday', 'Saturday'];
+              var today = days[new Date().getDay()];
+              expect(dayText).toBe(today);
+            });
+
+            test('uses new Date', function() {
+              expect(codeLines()).toMatch(/new\s+Date\s*\(/);
+            });
+
+            test('uses addEventListener', function() {
+              expect(codeLines()).toMatch(/addEventListener\s*\(/);
+            });
+
+            test('date in M D YYYY format', function() {
+              var dateText = text(document, 'myDate');
+              var now = new Date();
+              var expected = (now.getMonth() + 1) + '/' + now.getDate() + '/' + now.getFullYear();
+              expect(dateText).toBe(expected);
+            });
+
+            test('timer runs and increments', async function() {
+              var val1 = parseFloat(text(document, 'myTimer'));
+              await wait(150);
+              var val2 = parseFloat(text(document, 'myTimer'));
+              expect(val2).toBeGreaterThan(val1);
+            });
+
+            test('toggle stops and restarts', async function() {
+              // Timer should be running, button says "Stop"
+              expect(text(document, 'myBtn')).toBe('Stop');
+              // Click to stop
+              click(document, 'myBtn');
+              await wait(50);
+              expect(text(document, 'myBtn')).toBe('Start');
+              // Record value, wait, check it didn't change
+              var stoppedVal = text(document, 'myTimer');
+              await wait(100);
+              var afterStop = text(document, 'myTimer');
+              expect(afterStop).toBe(stoppedVal);
+              // Click to restart
+              click(document, 'myBtn');
+              await wait(50);
+              expect(text(document, 'myBtn')).toBe('Stop');
+              // The stopped value is already above 0, so require the timer to
+              // count again (from 0 or from where it stopped, either is fine).
+              var afterStart = parseFloat(text(document, 'myTimer'));
+              await wait(100);
+              var restarted = parseFloat(text(document, 'myTimer'));
+              expect(restarted).toBeGreaterThan(afterStart);
+            });
+
+            test('timer is monotonic', async function() {
+              // Make sure timer is running
+              if (text(document, 'myBtn') === 'Start') {
+                click(document, 'myBtn');
+                await wait(50);
+              }
+              var values = [];
+              for (var i = 0; i < 5; i++) {
+                values.push(parseFloat(text(document, 'myTimer')));
+                await wait(30);
+              }
+              for (var j = 1; j < values.length; j++) {
+                expect(values[j]).toBeGreaterThanOrEqual(values[j - 1]);
+              }
+              // A timer that never moves never goes backwards either: require it to count.
+              expect(values[values.length - 1]).toBeGreaterThan(values[0]);
+            });
+          });
+          TESTEOF
+
+      # === Graded steps (sum to 100) ===
+      - id: t_day_name
+        name: day name warm up
+        uses: cs-plus-plus/autograding-command-grader@v1
+        with:
+          test-name: day name warm up
+          setup-command: echo "ready"
+          command: npx jest --runInBand --testNamePattern "day name warm up$"
+          timeout: 60
+          max-score: 15
+
+      - id: t_new_date
+        name: uses new Date
+        uses: cs-plus-plus/autograding-command-grader@v1
+        with:
+          test-name: uses new Date
+          setup-command: echo "ready"
+          command: npx jest --runInBand --testNamePattern "uses new Date$"
+          timeout: 60
+          max-score: 10
+
+      - id: t_addeventlistener
+        name: uses addEventListener
+        uses: cs-plus-plus/autograding-command-grader@v1
+        with:
+          test-name: uses addEventListener
+          setup-command: echo "ready"
+          command: npx jest --runInBand --testNamePattern "uses addEventListener$"
+          timeout: 60
+          max-score: 5
+
+      - id: t_date_format
+        name: date in M D YYYY format
+        uses: cs-plus-plus/autograding-command-grader@v1
+        with:
+          test-name: date in M D YYYY format
+          setup-command: echo "ready"
+          command: npx jest --runInBand --testNamePattern "date in M D YYYY format$"
+          timeout: 60
+          max-score: 20
+
+      - id: t_timer_runs
+        name: timer runs and increments
+        uses: cs-plus-plus/autograding-command-grader@v1
+        with:
+          test-name: timer runs and increments
+          setup-command: echo "ready"
+          command: npx jest --runInBand --testNamePattern "timer runs and increments$"
+          timeout: 60
+          max-score: 20
+
+      - id: t_toggle
+        name: toggle stops and restarts
+        uses: cs-plus-plus/autograding-command-grader@v1
+        with:
+          test-name: toggle stops and restarts
+          setup-command: echo "ready"
+          command: npx jest --runInBand --testNamePattern "toggle stops and restarts$"
+          timeout: 60
+          max-score: 20
+
+      - id: t_monotonic
+        name: timer is monotonic
+        uses: cs-plus-plus/autograding-command-grader@v1
+        with:
+          test-name: timer is monotonic
+          setup-command: echo "ready"
+          command: npx jest --runInBand --testNamePattern "timer is monotonic$"
+          timeout: 60
+          max-score: 10
+
+      # Summary
+      - name: Build summary
+        shell: bash
+        run: |
+          npx jest --runInBand --json --outputFile=jest-summary.json || true
+          node - <<'NODE'
+          const fs = require("fs");
+          let jr = {};
+          try { jr = JSON.parse(fs.readFileSync("jest-summary.json","utf8")); } catch {}
+          const assertions = (jr.testResults||[]).flatMap(t => t.assertionResults || []);
+          const tests = [
+            { name: "day name warm up", pts: 15 },
+            { name: "uses new Date", pts: 10 },
+            { name: "uses addEventListener", pts: 5 },
+            { name: "date in M D YYYY format", pts: 20 },
+            { name: "timer runs and increments", pts: 20 },
+            { name: "toggle stops and restarts", pts: 20 },
+            { name: "timer is monotonic", pts: 10 },
+          ];
+          let earned = 0;
+          const lines = ["# Unit 8.8 Autograder Summary", ""];
+          for (const t of tests) {
+            const a = assertions.find(x => x.title === t.name);
+            const passed = !!a && a.status === "passed";
+            if (passed) earned += t.pts;
+            lines.push((passed ? "✅" : "❌") + " " + t.name + " (" + t.pts + " pts)");
+          }
+          lines.push("", "**Score: " + earned + "/100**");
+          console.log(lines.join("\n"));
+          if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          NODE
+
+      - name: Prepare reporter env
+        shell: bash
+        run: |
+          echo "T_DAY_NAME_RESULTS=${{ steps.t_day_name.outputs.result }}"               >> "$GITHUB_ENV"
+          echo "T_NEW_DATE_RESULTS=${{ steps.t_new_date.outputs.result }}"               >> "$GITHUB_ENV"
+          echo "T_ADDEVENTLISTENER_RESULTS=${{ steps.t_addeventlistener.outputs.result }}" >> "$GITHUB_ENV"
+          echo "T_DATE_FORMAT_RESULTS=${{ steps.t_date_format.outputs.result }}"         >> "$GITHUB_ENV"
+          echo "T_TIMER_RUNS_RESULTS=${{ steps.t_timer_runs.outputs.result }}"           >> "$GITHUB_ENV"
+          echo "T_TOGGLE_RESULTS=${{ steps.t_toggle.outputs.result }}"                   >> "$GITHUB_ENV"
+          echo "T_MONOTONIC_RESULTS=${{ steps.t_monotonic.outputs.result }}"             >> "$GITHUB_ENV"
+
+      - name: Report grades
+        uses: cs-plus-plus/autograding-grading-reporter@v1
+        with:
+          runners: 't_day_name,t_new_date,t_addeventlistener,t_date_format,t_timer_runs,t_toggle,t_monotonic'
+          token: ${{ github.token }}
